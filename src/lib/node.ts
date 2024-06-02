@@ -1,13 +1,19 @@
 import { NS, Server } from '@ns';
-import { canHack, discoverNodes } from './utils';
+import { canHack, clone, Context, discoverNodes, HACK_SECURITY_AMOUNT, log } from './utils';
 
 /**
  * Polls all nodes until one is available for scheduling and returns it
  */
-export const getNode = async (ns: NS, ram: number): Promise<Server> => {
+export const getNode = async (ctx: Context, ram: number, home = false): Promise<Server> => {
   return new Promise<Server>((r) => {
     const search = () => {
-      for (const node of discoverNodes(ns)) {
+      for (const node of discoverNodes(ctx.ns, home)) {
+        if (node.hostname === 'home') {
+          if (node.ramUsed > node.maxRam * 0.8) {
+            continue;
+          }
+        }
+
         if (ram === 0 && node.ramUsed === 0) {
           r(node);
           return true;
@@ -27,9 +33,9 @@ export const getNode = async (ns: NS, ram: number): Promise<Server> => {
 
     const searchTimeout = () => {
       setTimeout(() => {
-        ns.tprintf('INFO Searching for available node of %s RAM...', ns.formatRam(ram));
+        log(ctx, 'INFO Searching for available node of %s RAM...', ctx.ns.formatRam(ram));
         if (!search()) {
-          ns.tprintf('WARN No nodes available');
+          log(ctx, 'WARN No nodes available');
           searchTimeout();
         }
       }, 1000);
@@ -37,17 +43,17 @@ export const getNode = async (ns: NS, ram: number): Promise<Server> => {
 
     searchTimeout();
   }).then((node) => {
-    ns.tprintf('INFO Picked node: %s', node.hostname);
+    log(ctx, 'INFO Picked node: %s', node.hostname);
     return node;
   });
 };
 
-export const waitForRAM = (ns: NS, ram: number[]) => {
+export const waitForRAM = (ctx: Context, ram: number[], home = false) => {
   return new Promise<void>((r) => {
     const search = () => {
-      ns.tprintf('INFO Searching for nodes...');
+      log(ctx, 'INFO Searching for nodes...');
 
-      const nodes = discoverNodes(ns);
+      const nodes = discoverNodes(ctx.ns, home);
       const remaining = [...ram];
 
       remaining.sort((a, b) => b - a);
@@ -58,11 +64,12 @@ export const waitForRAM = (ns: NS, ram: number[]) => {
         for (let i = 0; i < remaining.length; i++) {
           if (remaining[i] < availableRAM) {
             availableRAM -= remaining[i];
-            ns.tprintf(
+            log(
+              ctx,
               'INFO Putting %s on %s (remaining %s)',
-              ns.formatRam(remaining[i]),
+              ctx.ns.formatRam(remaining[i]),
               node.hostname,
-              ns.formatRam(availableRAM),
+              ctx.ns.formatRam(availableRAM),
             );
             toRemove.push(i);
           }
@@ -79,7 +86,7 @@ export const waitForRAM = (ns: NS, ram: number[]) => {
         return true;
       }
 
-      ns.tprintf('WARN Not enough node memory available');
+      log(ctx, 'WARN Not enough node memory available');
 
       return false;
     };
@@ -103,52 +110,69 @@ export const waitForRAM = (ns: NS, ram: number[]) => {
 /**
  * Find best value target
  */
-export const findTarget = (ns: NS): Server => {
-  let maxMoneyServer: Server = ns.getServer();
+export const findTarget = (ctx: Context): Server => {
+  let maxMoneyServer: Server = ctx.ns.getServer();
+  let maxServerMoneyPerMs = 0;
 
-  for (const server of findAll(ns)) {
-    if (!canHack(ns, server.server)) {
+  for (const server of findAll(ctx.ns)) {
+    if (!canHack(ctx.ns, server.server)) {
       continue;
     }
 
     if (server.server.moneyMax) {
-      ns.tprintf(
-        'INFO [%s] Max Money: %s, Min Diff: %s',
-        server.server.hostname,
-        ns.formatNumber(server.server.moneyMax || 0),
-        ns.formatNumber(server.server.minDifficulty || 0),
-      );
-    }
+      const hackPercent = ctx.ns.hackAnalyze(server.server.hostname);
+      const hackMoney = hackPercent * (server.server.moneyMax || 0);
 
-    if ((server.server.moneyMax || 0) > (maxMoneyServer.moneyMax || 0)) {
-      maxMoneyServer = server.server;
+      const fake = clone(ctx.ns, server.server);
+      fake.moneyAvailable = fake.moneyMax;
+      fake.hackDifficulty = (fake.minDifficulty || 0) + HACK_SECURITY_AMOUNT;
+      const weakenTime = ctx.ns.formulas.hacking.weakenTime(fake, ctx.ns.getPlayer());
+
+      const moneyPerMs = hackMoney / weakenTime;
+
+      log(
+        ctx,
+        'INFO [%s] Max Money: %s, Min Diff: %s, Money/ms: %s (%s/%d ms)',
+        server.server.hostname,
+        ctx.ns.formatNumber(server.server.moneyMax || 0),
+        ctx.ns.formatNumber(server.server.minDifficulty || 0),
+        ctx.ns.formatNumber(moneyPerMs),
+        ctx.ns.formatNumber(hackMoney),
+        weakenTime,
+      );
+
+      if (moneyPerMs > maxServerMoneyPerMs) {
+        maxMoneyServer = server.server;
+        maxServerMoneyPerMs = moneyPerMs;
+      }
     }
   }
 
   // TODO Temporary override
-  maxMoneyServer = ns.getServer('lexo-corp');
+  // maxMoneyServer = ns.getServer('rothman-uni');
 
-  ns.tprintf(
-    'SUCCESS [%s] Chosen Target Money: %s',
+  log(
+    ctx,
+    'SUCCESS [%s] Chosen Target Money: %s/ms',
     maxMoneyServer.hostname,
-    ns.formatNumber(maxMoneyServer.moneyMax || 0),
+    ctx.ns.formatNumber(maxServerMoneyPerMs),
   );
 
-  const money = ns.getServerMoneyAvailable(maxMoneyServer.hostname);
-  const minSec = ns.getServerMinSecurityLevel(maxMoneyServer.hostname);
-  const sec = ns.getServerSecurityLevel(maxMoneyServer.hostname);
+  const money = ctx.ns.getServerMoneyAvailable(maxMoneyServer.hostname);
+  const minSec = ctx.ns.getServerMinSecurityLevel(maxMoneyServer.hostname);
+  const sec = ctx.ns.getServerSecurityLevel(maxMoneyServer.hostname);
 
-  ns.tprint(`
+  ctx.ns.tprint(`
 ${maxMoneyServer.hostname}:
-    $          : ${ns.formatNumber(money)} / ${ns.formatNumber(maxMoneyServer.moneyMax || 0)} (${(
+    $          : ${ctx.ns.formatNumber(money)} / ${ctx.ns.formatNumber(maxMoneyServer.moneyMax || 0)} (${(
     (money / (maxMoneyServer.moneyMax || 0)) *
     100
   ).toFixed(2)}%)
     security   : ${minSec.toFixed(2)} / ${sec.toFixed(2)}
-    hack time  : ${ns.tFormat(ns.getHackTime(maxMoneyServer.hostname))}
-    grow time  : ${ns.tFormat(ns.getGrowTime(maxMoneyServer.hostname))}
-    weaken time: ${ns.tFormat(ns.getWeakenTime(maxMoneyServer.hostname))}
-    hackChance : ${(ns.hackAnalyzeChance(maxMoneyServer.hostname) * 100).toFixed(2)}%
+    hack time  : ${ctx.ns.tFormat(ctx.ns.getHackTime(maxMoneyServer.hostname))}
+    grow time  : ${ctx.ns.tFormat(ctx.ns.getGrowTime(maxMoneyServer.hostname))}
+    weaken time: ${ctx.ns.tFormat(ctx.ns.getWeakenTime(maxMoneyServer.hostname))}
+    hackChance : ${(ctx.ns.hackAnalyzeChance(maxMoneyServer.hostname) * 100).toFixed(2)}%
 `);
 
   return maxMoneyServer;
