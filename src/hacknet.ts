@@ -33,53 +33,44 @@ export async function main(ns: NS) {
     const steps: Step[] = [];
 
     for (let i = 0; i < ns.hacknet.numNodes(); i++) {
-      let stats = ns.hacknet.getNodeStats(i);
-      const currentGain = calculateMoneyGainRate(ns, stats);
-
-      // Level
-      stats = ns.hacknet.getNodeStats(i);
-      stats.level += 1;
-      steps.push({
-        action: Action.BUY_LEVEL,
-        gain: (calculateMoneyGainRate(ns, stats) - currentGain) / ns.hacknet.getLevelUpgradeCost(i),
-        server: i,
-        cost: ns.hacknet.getLevelUpgradeCost(i),
-      });
-
-      // Memory
-      stats = ns.hacknet.getNodeStats(i);
-      stats.ram *= 2;
-      steps.push({
-        action: Action.BUY_RAM,
-        gain: (calculateMoneyGainRate(ns, stats) - currentGain) / ns.hacknet.getRamUpgradeCost(i),
-        server: i,
-        cost: ns.hacknet.getRamUpgradeCost(i),
-      });
-
-      // Cores
-      stats = ns.hacknet.getNodeStats(i);
-      stats.cores += 1;
-      steps.push({
-        action: Action.BUY_CORE,
-        gain: (calculateMoneyGainRate(ns, stats) - currentGain) / ns.hacknet.getCoreUpgradeCost(i),
-        server: i,
-        cost: ns.hacknet.getCoreUpgradeCost(i),
-      });
+      steps.push(
+        ...getSteps(
+          ns,
+          ns.hacknet.getLevelUpgradeCost(i),
+          ns.hacknet.getRamUpgradeCost(i),
+          ns.hacknet.getCoreUpgradeCost(i),
+          ns.hacknet.getNodeStats(i),
+          i,
+        ),
+      );
     }
 
+    // Node buying
     if (ns.hacknet.maxNumNodes() > ns.hacknet.numNodes()) {
-      const baseStats = ns.hacknet.getNodeStats(0);
-      baseStats.cores = 1;
-      baseStats.level = 1;
-      baseStats.ram = 1;
-      const baseGain = calculateMoneyGainRate(ns, baseStats);
+      if (ns.fileExists('Formulas.exe')) {
+        const [baseStats, cost] = simulateBuyNode(ns);
+        const baseGain = calculateMoneyGainRate(ns, baseStats);
 
-      steps.push({
-        action: Action.BUY_NODE,
-        gain: baseGain / ns.hacknet.getPurchaseNodeCost(),
-        cost: ns.hacknet.getPurchaseNodeCost(),
-        server: -1,
-      });
+        steps.push({
+          action: Action.BUY_NODE,
+          gain: baseGain / cost,
+          cost: cost,
+          server: -1,
+        });
+      } else {
+        const baseStats = ns.hacknet.getNodeStats(0);
+        baseStats.cores = 1;
+        baseStats.level = 1;
+        baseStats.ram = 1;
+        const baseGain = calculateMoneyGainRate(ns, baseStats);
+
+        steps.push({
+          action: Action.BUY_NODE,
+          gain: baseGain / ns.hacknet.getPurchaseNodeCost(),
+          cost: ns.hacknet.getPurchaseNodeCost(),
+          server: -1,
+        });
+      }
     }
 
     steps.sort((a, b) => b.gain - a.gain);
@@ -88,7 +79,7 @@ export async function main(ns: NS) {
     let done = false;
     for (let i = 0; i < 3; i++) {
       ns.printf(
-        '%d: hacknet-node-%d %9s %s/$ - $%8s (%s)',
+        '%d: [%d] %9s %s/$ - $%8s (%s)',
         i + 1,
         steps[i].server,
         steps[i].action,
@@ -133,4 +124,89 @@ const calculateMoneyGainRate = (ns: NS, stats: NodeStats) => {
   const ramMult = Math.pow(1.035, stats.ram - 1);
   const coresMult = (stats.cores + 5) / 6;
   return levelMult * ramMult * coresMult * mult * HacknetNodeMoney;
+};
+
+const simulateBuyNode = (ns: NS): [NodeStats, number] => {
+  let availableMoney = ns.getPlayer().money * MAX_MONEY_PERCENT_USE;
+  availableMoney -= ns.hacknet.getPurchaseNodeCost();
+
+  const stats = ns.hacknet.getNodeStats(0);
+  stats.level = 1;
+  stats.cores = 1;
+  stats.ram = 1;
+
+  while (availableMoney > 0) {
+    const levelCost = ns.formulas.hacknetNodes.levelUpgradeCost(
+      stats.level,
+      1,
+      ns.getPlayer().mults.hacknet_node_level_cost,
+    );
+    const ramCost = ns.formulas.hacknetNodes.ramUpgradeCost(stats.ram, 1, ns.getPlayer().mults.hacknet_node_ram_cost);
+    const coreCost = ns.formulas.hacknetNodes.coreUpgradeCost(
+      stats.cores,
+      1,
+      ns.getPlayer().mults.hacknet_node_core_cost,
+    );
+
+    const steps = getSteps(ns, levelCost, ramCost, coreCost, stats);
+    steps.sort((a, b) => b.gain - a.gain);
+
+    const step = steps[0];
+    if (step.cost > availableMoney) {
+      break;
+    }
+
+    availableMoney -= step.cost;
+
+    switch (step.action) {
+      case Action.BUY_CORE:
+        stats.cores++;
+        break;
+      case Action.BUY_RAM:
+        stats.ram *= 2;
+        break;
+      case Action.BUY_LEVEL:
+        stats.level++;
+        break;
+    }
+  }
+
+  return [stats, ns.getPlayer().money * MAX_MONEY_PERCENT_USE - availableMoney];
+};
+
+const getSteps = (ns: NS, levelCost: number, ramCost: number, coreCost: number, stats: NodeStats, i = 0): Step[] => {
+  const steps: Step[] = [];
+  const currentGain = calculateMoneyGainRate(ns, stats);
+
+  // Level
+  stats.level += 1;
+  steps.push({
+    action: Action.BUY_LEVEL,
+    gain: (calculateMoneyGainRate(ns, stats) - currentGain) / levelCost,
+    server: i,
+    cost: levelCost,
+  });
+  stats.level -= 1;
+
+  // Memory
+  stats.ram *= 2;
+  steps.push({
+    action: Action.BUY_RAM,
+    gain: (calculateMoneyGainRate(ns, stats) - currentGain) / ramCost,
+    server: i,
+    cost: ramCost,
+  });
+  stats.ram /= 2;
+
+  // Cores
+  stats.cores += 1;
+  steps.push({
+    action: Action.BUY_CORE,
+    gain: (calculateMoneyGainRate(ns, stats) - currentGain) / coreCost,
+    server: i,
+    cost: coreCost,
+  });
+  stats.cores -= 1;
+
+  return steps;
 };
